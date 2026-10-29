@@ -1,0 +1,111 @@
+name: NextDNS profile union
+
+# Runs every 12 hours, and on demand from the Actions tab.
+#
+# All configuration is read from GitHub *Variables* via `toJson(vars)`:
+# the repository itself never contains a key or a bot token.
+
+on:
+  schedule:
+    - cron: "0 */12 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "true = only show what would be added (nothing is written)"
+        type: choice
+        default: "true"
+        options: ["true", "false"]
+      full:
+        description: "true = ignore the state DB and re-apply the whole union (emergency only)"
+        type: choice
+        default: "false"
+        options: ["false", "true"]
+
+concurrency:
+  group: nextdns-profile-union
+  cancel-in-progress: false
+
+permissions:
+  contents: write        # needed to commit sync-state.json
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check variables
+        env:
+          ALL_VARS: ${{ toJson(vars) }}
+        run: python3 union.py --check
+
+      - name: Union sync
+        env:
+          ALL_VARS: ${{ toJson(vars) }}
+        run: |
+          set -o pipefail
+          ARGS=""
+          [ "${{ inputs.dry_run }}" = "true" ] && ARGS="$ARGS --dry-run"
+          [ "${{ inputs.full }}" = "true" ] && ARGS="$ARGS --full"
+          # A non-zero exit must not stop the job: the state DB still has to be
+          # committed, and failed items are retried on the next run.
+          python3 union.py $ARGS | tee sync.log \
+            || echo "::warning::union.py exited non-zero — see the log, failed items are retried next run"
+
+      - name: Commit state DB
+        if: always() && inputs.dry_run != 'true'
+        run: |
+          set -e
+          if git diff --quiet -- sync-state.json 2>/dev/null && \
+             [ -f sync-state.json ] && git ls-files --error-unmatch sync-state.json >/dev/null 2>&1; then
+            echo "state unchanged"
+            exit 0
+          fi
+          git config user.name  "nextdns-union-bot"
+          git config user.email "nextdns-union-bot@users.noreply.github.com"
+          git add sync-state.json
+          git commit -m "sync state: $(date -u +%Y-%m-%dT%H:%MZ)" || echo "nothing to commit"
+          for i in 1 2 3; do
+            git push && break || { echo "push failed, retrying"; git pull --rebase --autostash; sleep 5; }
+          done
+
+      - name: Telegram - notify on failure
+        if: failure() || cancelled()
+        env:
+          ALL_VARS: ${{ toJson(vars) }}
+        run: |
+          python3 - <<'PY' || true
+          import union as u
+          u.notify("💥 <b>NextDNS profile union - job failed or was cancelled</b>\n\n"
+                   "<code>${{ github.workflow }} #${{ github.run_number }}</code>\n"
+                   "<code>${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}</code>")
+          PY
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## NextDNS profile union"
+            echo ""
+            echo '```'
+            cat sync.log 2>/dev/null || echo "(no output)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload state and summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: union-artifacts
+          path: |
+            union-summary.json
+            sync-state.json
+            sync.log
+          if-no-files-found: warn
+          retention-days: 7
