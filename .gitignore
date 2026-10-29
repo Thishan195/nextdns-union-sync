@@ -1,0 +1,10 @@
+# python
+__pycache__/
+*.pyc
+
+# run outputs (do NOT add sync-state.json here!)
+sync.log
+union-summary.json
+
+# local secrets
+.env
